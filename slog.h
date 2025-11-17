@@ -37,7 +37,7 @@ enum slog_type {
 	SLOG_TYPE_PLAIN,
 };
 
-struct slog_field {
+struct slog_node {
 	enum slog_type type;
 
 	const char *key;
@@ -48,259 +48,265 @@ struct slog_field {
 		bool boolean;
 		enum slog_level level;
 		struct timespec time;
-		// struct slog_field *array;
-		struct slog_field *object;
+		// struct slog_node *array;
+		struct slog_node *object;
 	} value;
 
-	struct slog_field *next;
+	struct slog_node *next;
 };
 
-const struct slog_field slog_field_default;
+const struct slog_node slog_node_default;
 
-static thread_local struct slog_field *slog_field_tls = NULL;
+static thread_local struct slog_node *slog_node_thread_local = NULL;
 
-#ifndef SLOG_OUTPUT_SIZE
-#define SLOG_OUTPUT_SIZE 4096
+#ifndef SLOG_BUFFER_SIZE
+#define SLOG_BUFFER_SIZE 4096
 #endif
-static thread_local char output_buffer[SLOG_OUTPUT_SIZE] = {0};
-static thread_local size_t output_index = 1; // strlen() + 1
+static thread_local char slog_output_buffer[SLOG_BUFFER_SIZE] = {0};
+static thread_local size_t slog_buffer_index = 0; // without NULL
 
-struct slog_field *slog_field_get() {
-	struct slog_field *field;
+struct slog_node *slog_node_get() {
+	struct slog_node *node;
 
-	if (slog_field_tls) {
-		field = slog_field_tls;
-		slog_field_tls = field->next;
+	if (slog_node_thread_local) {
+		node = slog_node_thread_local;
+		slog_node_thread_local = node->next;
 	} else {
-		field = calloc(1, sizeof(*field));
+		node = calloc(1, sizeof(*node));
 	}
-	*field = slog_field_default;
-	return field;
+	*node = slog_node_default;
+	return node;
 }
 
-void slog_field_put(struct slog_field *field) {
-	if (!field) {
+void slog_node_put(struct slog_node *node) {
+	if (!node) {
 		return;
 	}
-	field->next = slog_field_tls;
-	slog_field_tls = field;
+	node->next = slog_node_thread_local;
+	slog_node_thread_local = node;
 }
 
-void slog_free(struct slog_field *field) {
-	if (!field) {
+void slog_node_free(struct slog_node *node) {
+	if (!node) {
 		return;
 	}
-	slog_free(field->next);
-	free(field);
+	slog_node_free(node->next);
+	free(node);
 }
 
-void SLOG_FREE(void) { slog_free(slog_field_tls); }
+void SLOG_FREE(void) {
+	slog_node_free(slog_node_thread_local);
+	slog_node_thread_local = NULL;
+}
 
-void slog_vfmt(const char *fmt, ...) {
-	if (!fmt || output_index >= SLOG_OUTPUT_SIZE) {
-		fprintf(stderr, "please increase SLOG_OUTPUT_SIZE");
+void slog_buffer_write(const char *fmt, ...) {
+	if (slog_buffer_index >= SLOG_BUFFER_SIZE) {
+		fprintf(stderr,
+			"Buffer full, please increase SLOG_BUFFER_SIZE\n");
 		return;
 	}
 
 	va_list args;
 	va_start(args, fmt);
 	// vprintf(fmt, args);
-	int written = vsnprintf(output_buffer + output_index - 1,
-				SLOG_OUTPUT_SIZE - output_index + 1, fmt, args);
+	int written =
+		vsnprintf(slog_output_buffer + slog_buffer_index,
+			  SLOG_BUFFER_SIZE - slog_buffer_index, fmt, args);
 	va_end(args);
 	if (written > 0) {
-		output_index += written;
+		slog_buffer_index += written;
 	}
 }
 
-struct slog_field *slog_field_vnew(enum slog_type type, const char *key,
-				   va_list ap) {
-	struct slog_field *field = slog_field_get();
-	field->key = key;
-	field->type = type;
+struct slog_node *slog_node_vcreate(enum slog_type type, const char *key,
+				    va_list ap) {
+	struct slog_node *node = slog_node_get();
+	node->key = key;
+	node->type = type;
 
-	struct slog_field *p, **pp;
+	struct slog_node *current, **next_ptr;
 
 	switch (type) {
 	case SLOG_TYPE_NULL:
 		break;
 	case SLOG_TYPE_STRING:
-		field->value.string = va_arg(ap, const char *);
+		node->value.string = va_arg(ap, const char *);
 		break;
 	case SLOG_TYPE_INT:
-		field->value.integer = va_arg(ap, long long);
+		node->value.integer = va_arg(ap, long long);
 		break;
 	case SLOG_TYPE_FLOAT:
-		field->value.number = va_arg(ap, double);
+		node->value.number = va_arg(ap, double);
 		break;
 	case SLOG_TYPE_BOOL:
-		field->value.boolean = va_arg(ap, int);
+		node->value.boolean = va_arg(ap, int);
 		break;
 	case SLOG_TYPE_TIME:
-		clock_gettime(CLOCK_REALTIME, &field->value.time);
+		clock_gettime(CLOCK_REALTIME, &node->value.time);
 		break;
 	// case SLOG_ARRAY:
 	case SLOG_TYPE_PLAIN:
 		assert(!key);
 	case SLOG_TYPE_OBJECT:
-		pp = &field->value.object;
-		while ((p = va_arg(ap, struct slog_field *)) != NULL) {
-			*pp = p;
-			pp = &p->next;
+		next_ptr = &node->value.object;
+		while ((current = va_arg(ap, struct slog_node *)) != NULL) {
+			*next_ptr = current;
+			next_ptr = &current->next;
 		}
 		break;
 	}
-	return field;
+	return node;
 }
 
-struct slog_field *slog_field_new(enum slog_type type, const char *key, ...) {
+struct slog_node *slog_node_create(enum slog_type type, const char *key, ...) {
 	va_list ap;
 	va_start(ap, key);
-	struct slog_field *field = slog_field_vnew(type, key, ap);
+	struct slog_node *node = slog_node_vcreate(type, key, ap);
 	va_end(ap);
-	return field;
+	return node;
 }
 
-void slog_fmt_escape(const char *str) {
+void slog_write_escape(const char *str) {
 	assert(str);
 
-	slog_vfmt("\"");
+	slog_buffer_write("\"");
 
 	for (const char *p = str; *p; p++) {
 		unsigned char c = *p;
 
 		switch (c) {
 		case '"':
-			slog_vfmt("\\\"");
+			slog_buffer_write("\\\"");
 			break;
 		case '\\':
-			slog_vfmt("\\\\");
+			slog_buffer_write("\\\\");
 			break;
 		case '\b':
-			slog_vfmt("\\b");
+			slog_buffer_write("\\b");
 			break;
 		case '\f':
-			slog_vfmt("\\f");
+			slog_buffer_write("\\f");
 			break;
 		case '\n':
-			slog_vfmt("\\n");
+			slog_buffer_write("\\n");
 			break;
 		case '\r':
-			slog_vfmt("\\r");
+			slog_buffer_write("\\r");
 			break;
 		case '\t':
-			slog_vfmt("\\t");
+			slog_buffer_write("\\t");
 			break;
 		default:
 			if (c < 0x20) {
-				slog_vfmt("\\u%04x", c);
+				slog_buffer_write("\\u%04x", c);
 			} else {
-				slog_vfmt("%c", c);
+				slog_buffer_write("%c", c);
 			}
 			break;
 		}
 	}
-	slog_vfmt("\"");
+	slog_buffer_write("\"");
 }
 
-void slog_fmt_time(struct slog_field *field) {
-	assert(field->type == SLOG_TYPE_TIME);
+void slog_write_time(struct slog_node *node) {
+	assert(node->type == SLOG_TYPE_TIME);
 
-	struct tm *t = localtime(&field->value.time.tv_sec);
+	struct tm *t = localtime(&node->value.time.tv_sec);
 
 	// YYYY-MM-DD HH:MM:SS.mmm
 	// 2025-11-16 11:15:25.123
 
-	slog_vfmt("\"time\": \"%04d-%02d-%02d %02d:%02d:%02d.%03ld\"",
-		  t->tm_year + 1900, t->tm_mon + 1, t->tm_mday, t->tm_hour,
-		  t->tm_min, t->tm_sec, field->value.time.tv_nsec / 1000000);
+	slog_buffer_write("\"time\": \"%04d-%02d-%02d %02d:%02d:%02d.%03ld\"",
+			  t->tm_year + 1900, t->tm_mon + 1, t->tm_mday,
+			  t->tm_hour, t->tm_min, t->tm_sec,
+			  node->value.time.tv_nsec / 1000000);
 }
 
-void slog_field_fmt(struct slog_field *field) {
-	while (field) {
-		struct slog_field *field_bk = field;
-		if (field->key) {
-			slog_fmt_escape(field->key);
-			slog_vfmt(": ");
+void slog_write_node(struct slog_node *node) {
+	while (node) {
+		struct slog_node *node_defer = node;
+		if (node->key) {
+			slog_write_escape(node->key);
+			slog_buffer_write(": ");
 		}
-		switch (field->type) {
+		switch (node->type) {
 		case SLOG_TYPE_STRING:
-			slog_fmt_escape(field->value.string);
+			slog_write_escape(node->value.string);
 			break;
 		case SLOG_TYPE_BOOL:
-			slog_vfmt("%s",
-				  field->value.boolean ? "true" : "false");
+			slog_buffer_write("%s", node->value.boolean ? "true"
+								    : "false");
 			break;
 		case SLOG_TYPE_INT:
-			slog_vfmt("%lld", field->value.integer);
+			slog_buffer_write("%lld", node->value.integer);
 			break;
 		case SLOG_TYPE_FLOAT:
-			slog_vfmt("%f", field->value.number);
+			slog_buffer_write("%f", node->value.number);
 			break;
 		case SLOG_TYPE_OBJECT:
-			slog_vfmt("{");
-			slog_field_fmt(field->value.object);
-			slog_vfmt("}");
+			slog_buffer_write("{");
+			slog_write_node(node->value.object);
+			slog_buffer_write("}");
 			break;
 		case SLOG_TYPE_PLAIN:
-			assert(!field->key);
-			slog_field_fmt(field->value.object);
+			assert(!node->key);
+			slog_write_node(node->value.object);
 			break;
 		case SLOG_TYPE_TIME:
-			slog_fmt_time(field);
+			slog_write_time(node);
 			break;
 		default:
 			break;
 		}
-		field = field->next;
-		if (field) {
-			slog_vfmt(", ");
+		node = node->next;
+		if (node) {
+			slog_buffer_write(", ");
 		}
-		slog_field_put(field_bk);
+		slog_node_put(node_defer);
 	}
 }
 
-static void slog_main(const char *file, const int line, const char *func,
-		      const char *level, const char *msg, ...) {
-	va_list fields;
-	va_start(fields, msg);
-	struct slog_field *extra =
-		slog_field_vnew(SLOG_TYPE_PLAIN, NULL, fields);
-	va_end(fields);
+static void slog_log_main(const char *file, const int line, const char *func,
+			  const char *level, const char *msg, ...) {
+	va_list nodes;
+	va_start(nodes, msg);
+	struct slog_node *extra =
+		slog_node_vcreate(SLOG_TYPE_PLAIN, NULL, nodes);
+	va_end(nodes);
 
 	if (strncmp(level, "SLOG_", 5) == 0) {
 		level = level + 5;
 	}
 
-	struct slog_field *root = slog_field_new(
+	struct slog_node *root = slog_node_create(
 		SLOG_TYPE_OBJECT, NULL,
-		slog_field_new(SLOG_TYPE_STRING, "file", file),
-		slog_field_new(SLOG_TYPE_INT, "line", line),
-		slog_field_new(SLOG_TYPE_STRING, "func", func),
-		slog_field_new(SLOG_TYPE_STRING, "level", level),
-		slog_field_new(SLOG_TYPE_STRING, "msg", msg),
-		slog_field_new(SLOG_TYPE_TIME, NULL), extra, NULL);
+		slog_node_create(SLOG_TYPE_STRING, "file", file),
+		slog_node_create(SLOG_TYPE_INT, "line", line),
+		slog_node_create(SLOG_TYPE_STRING, "func", func),
+		slog_node_create(SLOG_TYPE_STRING, "level", level),
+		slog_node_create(SLOG_TYPE_STRING, "msg", msg),
+		slog_node_create(SLOG_TYPE_TIME, NULL), extra, NULL);
 
-	output_index = 1;
-	output_buffer[0] = '\0';
+	slog_buffer_index = 0;
+	slog_output_buffer[0] = '\0';
 
-	slog_field_fmt(root);
+	slog_write_node(root);
 
-	fprintf(stdout, "%s\n", output_buffer);
+	fprintf(stdout, "%s\n", slog_output_buffer);
 	fflush(stdout);
 }
 
-#define SLOG_BOOL(K, V) slog_field_new(SLOG_TYPE_BOOL, K, V)
-#define SLOG_FLOAT(K, V) slog_field_new(SLOG_TYPE_FLOAT, K, V)
-#define SLOG_STRING(K, V) slog_field_new(SLOG_TYPE_STRING, K, V)
-#define SLOG_INT(K, V) slog_field_new(SLOG_TYPE_INT, K, V)
+#define SLOG_BOOL(K, V) slog_node_create(SLOG_TYPE_BOOL, K, V)
+#define SLOG_FLOAT(K, V) slog_node_create(SLOG_TYPE_FLOAT, K, V)
+#define SLOG_STRING(K, V) slog_node_create(SLOG_TYPE_STRING, K, V)
+#define SLOG_INT(K, V) slog_node_create(SLOG_TYPE_INT, K, V)
 #define SLOG_OBJECT(K, ...)                                                    \
-	slog_field_new(SLOG_TYPE_OBJECT, K __VA_OPT__(, ) __VA_ARGS__, NULL)
+	slog_node_create(SLOG_TYPE_OBJECT, K __VA_OPT__(, ) __VA_ARGS__, NULL)
 
 #define SLOG(LEVEL, MSG, ...)                                                  \
 	do {                                                                   \
-		slog_main(__FILE__, __LINE__, __func__, #LEVEL, MSG,           \
-			  ##__VA_ARGS__, NULL);                                \
+		slog_log_main(__FILE__, __LINE__, __func__, #LEVEL, MSG,       \
+			      ##__VA_ARGS__, NULL);                            \
 	} while (0)
 
 #endif // SLOG_H
