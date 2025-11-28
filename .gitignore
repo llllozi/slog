@@ -1,6 +1,4 @@
 .cache/
-.test
-a.out
-compile_commands.json
+build
 core
 tags

@@ -39,6 +39,17 @@ int main() {
 }
 ```
 
+## Development
+
+```bash
+meson setup build
+meson compile -C build
+meson test -C build
+meson test -C build --wrapper='valgrind'
+
+./format.sh
+```
+
 ## Acknowledgements
 
 Special thanks to [@XJJ](https://github.com/mivinci) for the valuable
